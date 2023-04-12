@@ -79,6 +79,7 @@ enum ConvertMode {
   gr2totem,
   gr2neo4j,
   mtx2gr,
+  mtxvoid2gr,
   nodelist2gr,
   pbbs2gr,
   svmlight2gr,
@@ -177,6 +178,7 @@ static cll::opt<ConvertMode> convertMode(
         clEnumVal(gr2totem, "Convert binary gr totem input format"),
         clEnumVal(gr2neo4j, "Convert binary gr to a vertex/edge csv for neo4j"),
         clEnumVal(mtx2gr, "Convert matrix market format to binary gr"),
+        clEnumVal(mtxvoid2gr, "Convert matrix market (void edge) format to binary gr"),
         clEnumVal(nodelist2gr, "Convert node list to binary gr"),
         clEnumVal(pbbs2gr, "Convert pbbs graph to binary gr"),
         clEnumVal(svmlight2gr, "Convert svmlight file to binary gr"),
@@ -694,6 +696,114 @@ struct Mtx2Gr : public HasNoVoidSpecialization {
         double weight = 1;
 
         infile >> cur_id >> neighbor_id >> weight;
+        if (cur_id == 0 || cur_id > nnodes) {
+          GALOIS_DIE("node id out of range: ", cur_id);
+        }
+        if (neighbor_id == 0 || neighbor_id > nnodes) {
+          GALOIS_DIE("neighbor id out of range: ", neighbor_id);
+        }
+
+        // 1 indexed
+        if (phase == 0) {
+          p.incrementDegree(cur_id - 1);
+        } else {
+          if constexpr (std::is_void<EdgeTy>::value) {
+            p.addNeighbor(cur_id - 1, neighbor_id - 1);
+          } else {
+            p.addNeighbor<EdgeTy>(cur_id - 1, neighbor_id - 1,
+                                  static_cast<EdgeTy>(weight));
+          }
+        }
+
+        skipLine(infile);
+      }
+
+      infile.peek();
+      if (!infile.eof()) {
+        GALOIS_DIE("additional lines in file");
+      }
+    }
+    // this is for the progress print
+
+    p.finish();
+
+    p.toFile(outfilename);
+    printStatus(p.size(), p.sizeEdges());
+  }
+};
+
+/**
+ * Convert matrix market matrix to binary graph.
+ *
+ * %% comments
+ * % ...
+ * <num nodes> <num nodes> <num edges>
+ * <src> <dst>
+ *
+ * src and dst start at 1.
+ */
+struct MtxVoid2Gr : public HasNoVoidSpecialization {
+  template <typename EdgeTy>
+  void convert(const std::string& infilename, const std::string& outfilename) {
+    typedef galois::graphs::FileGraphWriter Writer;
+
+    Writer p;
+    uint32_t nnodes;
+    size_t nedges;
+
+    for (int phase = 0; phase < 2; ++phase) {
+      std::ifstream infile(infilename.c_str());
+      if (!infile) {
+        GALOIS_DIE("failed to open input file");
+      }
+
+      // Skip comments
+      while (infile) {
+        if (infile.peek() != '%') {
+          break;
+        }
+        skipLine(infile);
+      }
+
+      // Read header
+      char header[256];
+      infile.getline(header, 256);
+      std::istringstream line(header, std::istringstream::in);
+      std::vector<std::string> tokens;
+      while (line) {
+        std::string tmp;
+        line >> tmp;
+        if (line) {
+          tokens.push_back(tmp);
+        }
+      }
+      if (tokens.size() != 3) {
+        GALOIS_DIE("unknown problem specification line: ", line.str());
+      }
+      // Prefer C functions for maximum compatibility
+      // nnodes = std::stoull(tokens[0]);
+      // nedges = std::stoull(tokens[2]);
+      nnodes = strtoull(tokens[0].c_str(), NULL, 0);
+      nedges = strtoull(tokens[2].c_str(), NULL, 0);
+
+      // Parse edges
+      if (phase == 0) {
+        p.setNumNodes(nnodes);
+        p.setNumEdges<EdgeTy>(nedges);
+        p.phase1();
+      } else {
+        p.phase2();
+      }
+
+      for (size_t edge_num = 0; edge_num < nedges; ++edge_num) {
+        if ((edge_num % (nedges / 500)) == 0) {
+          printf("Phase %d: current edge progress %lf%%\n", phase,
+                 ((double)edge_num / nedges) * 100);
+        }
+        uint32_t cur_id, neighbor_id;
+        double weight = 1;
+
+        infile >> cur_id >> neighbor_id;
         if (cur_id == 0 || cur_id > nnodes) {
           GALOIS_DIE("node id out of range: ", cur_id);
         }
@@ -3010,6 +3120,9 @@ int main(int argc, char** argv) {
     break;
   case mtx2gr:
     convert<Mtx2Gr>();
+    break;
+  case mtxvoid2gr:
+    convert<MtxVoid2Gr>();
     break;
   case nodelist2gr:
     convert<Nodelist2Gr>();
